@@ -1,291 +1,170 @@
-"""
-Weighted XGBoost model training for KYRBS suicidal ideation/plan/attempt.
-All comments fully translated to English for public GitHub release.
-"""
+"""Primary survey-weighted XGBoost analysis for the KYRBS study.
 
+This script is aligned to the three uploaded Scientific Reports revision
+notebooks. The full-period primary models use V_TRT (not the network-only
+V_TRT_BIN variable), PSU-preserving train/test splitting, survey weights, and
+5-fold StratifiedGroupKFold tuning. Alternative decision thresholds remain a
+separate exploratory revision analysis.
+"""
 from __future__ import annotations
 
+import argparse
 import json
+import pickle
+from collections import OrderedDict
 from pathlib import Path
-from typing import Tuple, Dict, Any
 
 import numpy as np
 import pandas as pd
-from collections import OrderedDict
-
-from sklearn.impute import SimpleImputer
-from sklearn.model_selection import GroupShuffleSplit, RandomizedSearchCV, StratifiedGroupKFold
-from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, f1_score,
-    roc_curve, auc, precision_recall_curve, average_precision_score,
-    brier_score_loss, confusion_matrix, make_scorer
-)
 from sklearn.calibration import calibration_curve
-
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (accuracy_score, auc, average_precision_score,
+                             confusion_matrix, f1_score, make_scorer,
+                             precision_score, recall_score, roc_curve)
+from sklearn.model_selection import GroupShuffleSplit, RandomizedSearchCV, StratifiedGroupKFold
+from sklearn.preprocessing import LabelEncoder
 from xgboost import XGBClassifier
 
-
-# --------------------------------------------------------
-# Configuration
-# --------------------------------------------------------
 DATA_CSV = "analysis_variables_only.csv"
-
 YEAR_COL = "YEAR"
 WEIGHT_COL = "W"
 PSU_COL = "PSU_ID"
-
-# Change this to M_SUI_PLAN or M_SUI_ATT for other outcomes
-TARGET_COL = "M_SUI_CON"
+RANDOM_STATE = 42
+N_JOBS = -1
 
 FEATURE_COLS = [
-    "M_SAD", "M_STR", "M_LON", "M_SLP_EN", "V_TRT_BIN",
-    "PR_HT", "PR_BI", "SEX",
-    "AS_DG_LT", "RH_DG_LT", "ECZ_DG_LT",
-    "PA_TOT", "PA_VIG_D", "PA_MSC",
+    "M_SAD", "M_STR", "M_SLP_EN", "V_TRT", "PR_HT", "PR_BI", "SEX",
+    "AS_DG_LT", "RH_DG_LT", "ECZ_DG_LT", "PA_TOT", "PA_VIG_D", "PA_MSC",
     "WEEKDAY_SLEEP_CATEGORY", "AC_LT", "TC_LT", "DR_HAB_PUR", "S_SI",
     "F_BR", "F_FRUIT", "F_FASTFOOD", "F_CAFF_A", "F_WAT",
     "E_SES", "E_S_RCRD", "CTYPE",
 ]
 
-RANDOM_STATE = 42
-N_JOBS = -1
+OUTCOMES = {
+    "ideation": {"candidates": ["M_SUI_CON"], "mapping": {2: 0, 3: 1}},
+    "planning": {"candidates": ["M_SUI_PLN", "M_SUI_PLAN"], "mapping": {1: 0, 2: 1}},
+    "attempt": {"candidates": ["M_SUI_ATT"], "mapping": {1: 0, 2: 1}},
+}
 
 
-# --------------------------------------------------------
-# Utilities
-# --------------------------------------------------------
-
-def recode_target_2_3_to_01(series: pd.Series) -> pd.Series:
-    """
-    Convert suicidal variables: 2 = No, 3 = Yes → 0/1.
-    """
-    return pd.to_numeric(series, errors="coerce").map({2: 0, 3: 1})
+def resolve_target(df: pd.DataFrame, outcome: str):
+    spec = OUTCOMES[outcome]
+    for col in spec["candidates"]:
+        if col in df.columns:
+            y = pd.to_numeric(df[col], errors="coerce").map(spec["mapping"])
+            return col, y
+    raise KeyError(f"No target column found for {outcome}: {spec['candidates']}")
 
 
-def build_core_dataset(df: pd.DataFrame):
-    """
-    Build core analysis dataset using:
-    - shift-adjusted target
-    - probability weights W / number of years
-    - PSU-based grouping
-    """
+def robust_encode_col(s: pd.Series) -> pd.Series:
+    """Mirror the notebook's defensive numeric/categorical encoding."""
+    s2 = s.replace({"A": 1, "B": 2, "C": 3, "High": 1, "Middle": 2,
+                    "Low": 3, "None": 1, "Experienced": 2})
+    num = pd.to_numeric(s2, errors="coerce")
+    if num.notna().sum() == 0 and (s2.dtype == "object" or str(s2.dtype).startswith("string")):
+        missing = s2.isna()
+        le = LabelEncoder()
+        enc = pd.Series(le.fit_transform(s2.fillna("<<NA>>").astype(str)), index=s2.index, dtype=float)
+        enc[missing] = np.nan
+        return enc
+    return num.astype(float)
+
+
+def build_core_dataset(df: pd.DataFrame, outcome: str):
+    target_col, y = resolve_target(df, outcome)
     n_years = df[YEAR_COL].nunique()
     w_new = pd.to_numeric(df[WEIGHT_COL], errors="coerce") / max(n_years, 1)
-
-    y = recode_target_2_3_to_01(df[TARGET_COL])
-
-    core_mask = (
-        y.notna()
-        & w_new.notna()
-        & df[YEAR_COL].notna()
-        & df[PSU_COL].notna()
-    )
-
-    df_core = df.loc[core_mask].copy()
-    y_core = y.loc[core_mask]
-    w_core = w_new.loc[core_mask]
-    g_core = df_core[PSU_COL]
-
-    X_core = df_core[FEATURE_COLS].copy()
-
-    return X_core, y_core, w_core, g_core
+    mask = y.notna() & w_new.notna() & df[YEAR_COL].notna() & df[PSU_COL].notna()
+    available = [c for c in FEATURE_COLS if c in df.columns]
+    X = pd.DataFrame({c: robust_encode_col(df.loc[mask, c]) for c in available})
+    return X, y.loc[mask].astype(int), w_new.loc[mask], df.loc[mask, PSU_COL], target_col
 
 
-def split_with_class_check(
-    X, y, w, groups,
-    test_size: float = 0.2,
-    max_tries: int = 200,
-    seed: int = RANDOM_STATE,
-):
-    """
-    GroupShuffleSplit based on PSU.
-    Ensures both train/test contain both class 0 and 1.
-    Retries with different seeds until successful.
-    """
+def split_with_class_check(X, y, w, groups, test_size=0.2, max_tries=200, seed=RANDOM_STATE):
     rng = np.random.RandomState(seed)
     for _ in range(max_tries):
         rs = int(rng.randint(0, 10_000_000))
-        gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=rs)
-        tr, te = next(gss.split(X, y, groups=groups))
+        tr, te = next(GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=rs).split(X, y, groups=groups))
         if y.iloc[tr].nunique() == 2 and y.iloc[te].nunique() == 2:
-            return (
-                X.iloc[tr], X.iloc[te],
-                y.iloc[tr], y.iloc[te],
-                w.iloc[tr], w.iloc[te],
-                groups.iloc[tr], groups.iloc[te],
-            )
-    raise ValueError("Failed to produce a split containing both classes 0 and 1 in train/test.")
+            return X.iloc[tr], X.iloc[te], y.iloc[tr], y.iloc[te], w.iloc[tr], w.iloc[te], groups.iloc[tr], groups.iloc[te]
+    raise ValueError("Could not produce PSU-grouped train/test sets containing both classes.")
 
 
-def weighted_brier_score(y_true, y_prob, sample_weight=None) -> float:
-    """Weighted Brier score."""
-    y_true = np.asarray(y_true, dtype=float)
-    y_prob = np.asarray(y_prob, dtype=float)
-    if sample_weight is None:
-        sample_weight = np.ones_like(y_true)
-    sample_weight = np.asarray(sample_weight, dtype=float)
-    return np.average((y_prob - y_true) ** 2, weights=sample_weight)
+def weighted_brier(y_true, y_prob, sample_weight):
+    return float(np.average((np.asarray(y_prob)-np.asarray(y_true))**2, weights=np.asarray(sample_weight)))
 
 
-def make_base_xgb() -> XGBClassifier:
-    """Base XGBoost model used for hyperparameter search."""
-    return XGBClassifier(
-        objective="binary:logistic",
-        eval_metric="logloss",
-        random_state=RANDOM_STATE,
-        tree_method="hist",
-        n_estimators=500,
-        learning_rate=0.03,
-        max_depth=4,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        min_child_weight=1.0,
-        n_jobs=N_JOBS,
-    )
+def make_base_xgb():
+    return XGBClassifier(objective="binary:logistic", eval_metric="logloss",
+                         random_state=RANDOM_STATE, tree_method="hist", n_jobs=N_JOBS)
 
-def fit_with_cv(
-    X_train, y_train, w_train, groups_train
-):
-    """
-    Fit model with hyperparameter tuning using:
-    - StratifiedGroupKFold
-    - RandomizedSearchCV
-    - Weighted AUROC as scoring metric
-    """
-    base_model = make_base_xgb()
 
-    param_dist = {
-        "max_depth": [3, 4, 5],
-        "learning_rate": [0.02, 0.03, 0.05],
-        "n_estimators": [400, 600, 800],
-        "subsample": [0.7, 0.8, 0.9],
-        "colsample_bytree": [0.7, 0.8, 1.0],
-        "min_child_weight": [1.0, 2.0, 5.0],
+def fit_with_cv(X_train, y_train, w_train, groups_train):
+    params = {
+        "max_depth": [3, 4, 5], "learning_rate": [0.02, 0.03, 0.05],
+        "n_estimators": [400, 600, 800], "subsample": [0.7, 0.8, 0.9],
+        "colsample_bytree": [0.7, 0.8, 1.0], "min_child_weight": [1.0, 2.0, 5.0],
     }
-
-    def weighted_roc_auc(y_true, y_pred, sample_weight=None):
+    def weighted_auc(y_true, y_pred, sample_weight=None):
         fpr, tpr, _ = roc_curve(y_true, y_pred, sample_weight=sample_weight)
         return auc(fpr, tpr)
-
-    scorer = make_scorer(weighted_roc_auc, needs_proba=True)
+    scorer = make_scorer(weighted_auc, needs_proba=True)
     cv = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
-
-    search = RandomizedSearchCV(
-        estimator=base_model,
-        param_distributions=param_dist,
-        n_iter=30,
-        scoring=scorer,
-        n_jobs=N_JOBS,
-        cv=cv.split(X_train, y_train, groups_train),
-        verbose=1,
-        random_state=RANDOM_STATE,
-        refit=True,
-    )
+    search = RandomizedSearchCV(make_base_xgb(), params, n_iter=30, scoring=scorer,
+                                cv=cv.split(X_train, y_train, groups_train), n_jobs=N_JOBS,
+                                random_state=RANDOM_STATE, refit=True, verbose=1)
     search.fit(X_train, y_train, sample_weight=w_train)
-
-    return search.best_estimator_, {
-        "best_params": search.best_params_,
-        "best_score": float(search.best_score_),
-    }
+    return search.best_estimator_, {"best_params": search.best_params_, "best_score": float(search.best_score_)}
 
 
 def evaluate_model(model, X_test, y_test, w_test):
-    """
-    Evaluate model performance:
-    - AUROC / AUPRC
-    - accuracy / precision / recall / F1 (default 0.5 threshold)
-    - optimal threshold maximizing weighted F1
-    - Brier score
-    - confusion matrices
-    - calibration curve
-    """
-    y_proba = model.predict_proba(X_test)[:, 1]
-    y_pred_default = (y_proba >= 0.5).astype(int)
-
-    fpr, tpr, _ = roc_curve(y_test, y_proba, sample_weight=w_test)
-    auc_roc = auc(fpr, tpr)
-
-    precision, recall, thr_pr = precision_recall_curve(y_test, y_proba, sample_weight=w_test)
-    auprc = average_precision_score(y_test, y_proba, sample_weight=w_test)
-
-    # Find best threshold
-    f1_scores = []
-    for thr in thr_pr:
-        if 0 < thr < 1:
-            pred_thr = (y_proba >= thr).astype(int)
-            f1_scores.append((
-                thr,
-                f1_score(
-                    y_test, pred_thr,
-                    average="weighted", zero_division=0,
-                    sample_weight=w_test
-                )
-            ))
-
-    best_thr, best_f1 = max(f1_scores, key=lambda x: x[1]) if f1_scores else (0.5, f1_score(
-        y_test, y_pred_default, average="weighted", zero_division=0, sample_weight=w_test))
-
-    y_pred_opt = (y_proba >= best_thr).astype(int)
-
-    cm_default = confusion_matrix(y_test, y_pred_default)
-    cm_opt = confusion_matrix(y_test, y_pred_opt)
-
-    frac_pos, mean_pred = calibration_curve(y_test, y_proba, n_bins=10, strategy="quantile")
-
+    prob = model.predict_proba(X_test)[:, 1]
+    pred = (prob >= 0.50).astype(int)
+    fpr, tpr, _ = roc_curve(y_test, prob, sample_weight=w_test)
     metrics = OrderedDict([
-        ("auc_roc", float(auc_roc)),
-        ("auprc", float(auprc)),
-        ("best_threshold", float(best_thr)),
-        ("f1_opt", float(best_f1)),
-        ("brier", float(weighted_brier_score(y_test, y_proba, sample_weight=w_test))),
+        ("threshold", 0.50), ("auc_roc", float(auc(fpr, tpr))),
+        ("average_precision", float(average_precision_score(y_test, prob, sample_weight=w_test))),
+        ("positive_precision", float(precision_score(y_test, pred, sample_weight=w_test, zero_division=0))),
+        ("positive_recall", float(recall_score(y_test, pred, sample_weight=w_test, zero_division=0))),
+        ("positive_f1", float(f1_score(y_test, pred, sample_weight=w_test, zero_division=0))),
+        ("weighted_f1", float(f1_score(y_test, pred, average="weighted", sample_weight=w_test, zero_division=0))),
+        ("accuracy", float(accuracy_score(y_test, pred, sample_weight=w_test))),
+        ("brier", weighted_brier(y_test, prob, w_test)),
     ])
+    cm = confusion_matrix(y_test, pred, labels=[0,1], sample_weight=w_test)
+    frac_pos, mean_pred = calibration_curve(y_test, prob, n_bins=10, strategy="quantile")
+    return metrics, cm, mean_pred, frac_pos, prob
 
-    return {
-        "metrics": metrics,
-        "confusion_default": cm_default.tolist(),
-        "confusion_opt": cm_opt.tolist(),
-        "calibration_curve": {
-            "mean_pred": mean_pred.tolist(),
-            "frac_pos": frac_pos.tolist(),
-        },
-    }
+
+def run_outcome(df: pd.DataFrame, outcome: str):
+    outdir = Path(f"outputs_{outcome}"); outdir.mkdir(exist_ok=True)
+    X, y, w, groups, target_col = build_core_dataset(df, outcome)
+    Xtr0, Xte0, ytr, yte, wtr, wte, gtr, _ = split_with_class_check(X, y, w, groups)
+    imp = SimpleImputer(strategy="most_frequent")
+    Xtr = pd.DataFrame(imp.fit_transform(Xtr0), columns=X.columns)
+    Xte = pd.DataFrame(imp.transform(Xte0), columns=X.columns)
+    model, cv_results = fit_with_cv(Xtr, ytr, wtr, gtr)
+    metrics, cm, mean_pred, frac_pos, prob = evaluate_model(model, Xte, yte, wte)
+    model.save_model(outdir / "xgb_model.json")
+    with open(outdir / "imputer.pkl", "wb") as f: pickle.dump(imp, f)
+    with open(outdir / "cv_results.json", "w") as f: json.dump(cv_results, f, indent=2)
+    with open(outdir / "eval_results.json", "w") as f:
+        json.dump({"target_column": target_col, "metrics": metrics,
+                   "confusion_default_weighted": cm.tolist(),
+                   "calibration_curve": {"mean_pred": mean_pred.tolist(), "frac_pos": frac_pos.tolist()}}, f, indent=2)
+    pd.DataFrame({"y_true": np.asarray(yte), "y_prob": prob,
+                  "sample_weight": np.asarray(wte)}).to_csv(outdir / f"predictions_{outcome}.csv", index=False)
+    print(f"[{outcome}] target={target_col}; n={len(y)}; metrics={dict(metrics)}")
 
 
 def main():
-    outdir = Path("outputs_suicidal_ideation")
-    outdir.mkdir(exist_ok=True)
-
-    df = pd.read_csv(DATA_CSV, encoding="utf-8-sig", keep_default_na=False, na_values=[], low_memory=False)
-    X_core, y_core, w_core, g_core = build_core_dataset(df)
-
-    X_tr_raw, X_te_raw, y_tr, y_te, w_tr, w_te, g_tr, g_te = split_with_class_check(
-        X_core, y_core, w_core, g_core, test_size=0.2
-    )
-
-    imp = SimpleImputer(strategy="most_frequent")
-    X_tr = pd.DataFrame(imp.fit_transform(X_tr_raw), columns=X_core.columns)
-    X_te = pd.DataFrame(imp.transform(X_te_raw), columns=X_core.columns)
-
-    model, cv_results = fit_with_cv(X_tr, y_tr, w_tr, g_tr)
-    eval_results = evaluate_model(model, X_te, y_te, w_te)
-
-    # Save artifacts
-    model.save_model(outdir / "xgb_model.json")
-
-    import pickle
-    with open(outdir / "imputer.pkl", "wb") as f:
-        pickle.dump(imp, f)
-
-    with open(outdir / "cv_results.json", "w", encoding="utf-8") as f:
-        json.dump(cv_results, f, indent=2)
-
-    with open(outdir / "eval_results.json", "w", encoding="utf-8") as f:
-        json.dump(eval_results, f, indent=2)
-
-    print("[Training completed]")
-    print("Best CV score:", cv_results)
-    print("Evaluation:", eval_results["metrics"])
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--outcome", choices=["ideation", "planning", "attempt", "all"], default="all")
+    parser.add_argument("--data", default=DATA_CSV)
+    args = parser.parse_args()
+    df = pd.read_csv(args.data, encoding="utf-8-sig", low_memory=False)
+    outcomes = OUTCOMES if args.outcome == "all" else [args.outcome]
+    for outcome in outcomes: run_outcome(df, outcome)
 
 if __name__ == "__main__":
     main()

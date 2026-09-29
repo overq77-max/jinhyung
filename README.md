@@ -1,152 +1,115 @@
-# Adolescent Suicide Risk Prediction using Explainable Machine Learning and Correlation Network Modeling
+# Adolescent Suicidality in South Korea: Explainable Machine Learning and Correlation Network Analysis
 
-This repository provides a clean, reproducible analysis pipeline for predicting adolescent suicidal behaviors using Korean Youth Risk Behavior Survey (KYRBS) data (2015–2024).  
-The project integrates weighted machine learning, model explainability, and correlation-based network analysis to identify key risk factors and their interconnections.
+Code repository accompanying the manuscript **“Explainable machine learning and correlation-based network analysis of self-reported adolescent suicidality in South Korea: a repeated cross-sectional study, 2015–2024.”**
 
----
+The analysis uses Korean Youth Risk Behavior Survey (KYRBS) data from 2015–2024. Raw KYRBS microdata are not distributed in this repository.
 
-## 🔍 Project Overview
+## Source-of-truth alignment
 
-This repository includes:
+The revision branch has been reconciled against the outcome-specific Scientific Reports revision notebooks for suicidal ideation, suicidal planning, suicide attempt, and the correlation-network analysis. The public scripts preserve the notebook conventions that materially affect the analysis: outcome-specific coding, PSU-grouped splitting, survey weighting, the primary full-period feature set, and the final numbered correlation-network construction.
 
-- **Data preprocessing**  
-  Clean and harmonize KYRBS variables, compute derived features (BMI categories, sleep duration, etc.)
+Important variable conventions:
 
-- **Weighted machine learning models**  
-  Train XGBoost models using survey weights and PSU-based cross-validation.
+- Suicidal ideation: `M_SUI_CON`, coded 2→0 and 3→1.
+- Suicidal planning: accepts `M_SUI_PLN` or `M_SUI_PLAN`, coded 1→0 and 2→1.
+- Suicide attempt: `M_SUI_ATT`, coded 1→0 and 2→1.
+- The primary prediction models use `V_TRT` as in the outcome notebooks.
+- `V_TRT_BIN` is a network-specific binary standardization used for the correlation matrix.
+- Loneliness is not inserted into the full 2015–2024 primary model because of structural wave non-availability; it is handled in the restricted-wave sensitivity analysis described in the manuscript.
 
-- **Explainability-ready outputs**  
-  Models output probabilities suitable for SHAP interpretation.
+## Repository structure
 
-- **Correlation network analysis**  
-  Compute weighted Pearson correlations and generate network graphs with centrality metrics.
-
-This project is designed for public release, reproducibility, and further research extension.
-
----
-
-## 📁 Project Structure
-
-```
-kyrbs-suicide-risk/
-│
+```text
+jinhyung/
 ├── README.md
-├── requirements.txt
-│
-├── src/
-│ ├── preprocess_kyrbs.py # Data cleaning and feature construction
-│ ├── train_weighted_xgb.py # Weighted ML model pipeline
-│ └── build_corr_network.py # Weighted correlation network
-│
-└── outputs/ # Auto-generated results (models, plots, tables)
+└── kyrbs-suicide-risk/
+    ├── requirements.txt
+    └── src/
+        ├── preprocess_kyrbs.py
+        ├── train_weighted_xgb.py
+        ├── build_corr_network.py
+        ├── revision_table2_models.py
+        ├── revision_threshold_sensitivity.py
+        └── revision_figure2_roc.py
 ```
----
-## ⚙️ Installation
 
-### 1. Clone the repository:
+## Installation
 
 ```bash
-git clone https://github.com/<your-username>/kyrbs-suicide-risk.git
-cd kyrbs-suicide-risk
+git clone https://github.com/overq77-max/jinhyung.git
+cd jinhyung/kyrbs-suicide-risk
+pip install -r requirements.txt
 ```
 
-### 2. Install dependencies:
-```
-pip install -r requirements.txt 
-```
+Place the locally harmonized `analysis_variables_only.csv` in the working directory.
 
-#### 🧹 1. Data Preprocessing
+## Primary XGBoost analysis
 
-```
-Script: src/preprocess_kyrbs.py
+`src/train_weighted_xgb.py` runs the three primary outcomes with the across-wave adjusted survey weight, PSU-preserving train/test splitting, training-set-fitted imputation, and 5-fold `StratifiedGroupKFold` tuning. It reports default-threshold (0.50) AUROC, average precision, positive-class precision/recall/F1, weighted F1, accuracy, and Brier score, and exports aligned held-out labels/probabilities/weights.
 
-This script:
+Run all outcomes:
 
-Loads the raw KYRBS dataset (kyrbs_merged.csv)
-
-Computes BMI values & categories
-
-Computes sleep duration and weekday sleep categories
-
-Recodes suicidal variables (2 = No, 3 = Yes)
-
-Selects final analysis variables
-
-Outputs: analysis_variables_only.csv
-
-Run: python src/preprocess_kyrbs.py 
+```bash
+python src/train_weighted_xgb.py --outcome all
 ```
 
-#### 🤖 2. Weighted Machine Learning (XGBoost)
+Or run one outcome:
 
-```
-Script: src/train_weighted_xgb.py
-
-This script:
-
-Computes adjusted survey weights
-
-Splits train/test while respecting PSU clusters
-
-Applies imputation
-
-Performs hyperparameter search with StratifiedGroupKFold
-
-Evaluates model with AUROC, AUPRC, F1, calibration curves
-
-Saves model artifacts and evaluation outputs
-
-Run:python src/train_weighted_xgb.py
-
-To switch outcomes:TARGET_COL = "M_SUI_PLAN"   # suicidal plan
-                   TARGET_COL = "M_SUI_ATT"    # suicidal attempt
+```bash
+python src/train_weighted_xgb.py --outcome ideation
+python src/train_weighted_xgb.py --outcome planning
+python src/train_weighted_xgb.py --outcome attempt
 ```
 
-#### 🔗 3. Correlation Network Analysis
+## Revised Table 2
 
+`src/revision_table2_models.py` evaluates XGBoost, Random Forest, and Logistic Regression on the same outcome-specific held-out sample. It reports AUROC, AP/AUPRC, positive-class precision/recall/F1, weighted F1, and accuracy. The same fitted models should be passed to the Figure 2 ROC utility so plotted AUROC values remain synchronized with Table 2.
+
+## Supplementary Table S12
+
+`src/revision_threshold_sensitivity.py` compares the default 0.50 threshold, the threshold maximizing Youden’s J, and the threshold maximizing survey-weighted positive-class F1. It reports sensitivity, specificity, PPV, NPV, positive-class F1, balanced accuracy, and accuracy.
+
+Example:
+
+```bash
+python src/revision_threshold_sensitivity.py \
+  outputs_ideation/predictions_ideation.csv \
+  --outcome "Suicidal ideation" \
+  --output outputs_revision/threshold_sensitivity_ideation.csv
 ```
-Script: src/build_corr_network.py
 
-This script:
+Alternative thresholds are exploratory because threshold selection and evaluation use the same held-out predictions; they are not clinically validated screening or triage cutoffs.
 
-Computes weighted Pearson correlations (|r| ≥ 0.10)
+## Revised Figure 2
 
-Builds an undirected network graph
+`src/revision_figure2_roc.py` generates outcome-specific ROC curves from the same XGBoost, Random Forest, and Logistic Regression fits used for revised Table 2.
 
-Computes centrality metrics
+## Revised Figure 4: correlation network
 
-Saves:
+`src/build_corr_network.py` reproduces the final notebook logic for the descriptive network:
 
-correlation matrix
+- all three suicidality outcomes are included in the same weighted correlation matrix;
+- `M_SUI_PLN` and `M_SUI_PLAN` are handled as aliases for suicidal planning;
+- `V_TRT_BIN` is generated from `V_TRT` when necessary;
+- `PR_BI` is removed from the final displayed network, matching the notebook’s original node-9 deletion and renumbering;
+- edges with `|r| < 0.10` are omitted only for visual filtering;
+- all retained edges are solid and edge width is `10 × |r|` continuously;
+- positive/negative correlations are shown separately by edge color; and
+- weighted betweenness/closeness use `distance = 1 / |r|`.
 
-edge list
+The Pearson network is a descriptive map of marginal cross-sectional associations. It is not interpreted as a causal, temporal, or conditional-independence network.
 
-centrality tables
+## Reproducibility safeguards
 
-network visualizations
+The three outcomes have different outcome-specific samples. Labels, probabilities, survey weights, model fits, threshold analyses, and ROC curves must therefore come from the same outcome and the same held-out split. The revision utilities contain alignment checks to reduce accidental cross-outcome reuse.
 
-Run: python src/build_corr_network.py
-```
-🧪 Requirements
-```
-pandas
-numpy
-scikit-learn
-xgboost
-networkx
-matplotlib
-```
----
+Generated outputs are intentionally not committed as source files. Raw KYRBS data must be obtained independently from the Korea Disease Control and Prevention Agency (KDCA) under the applicable data-use requirements.
 
-## 📄 Notes
+## Requirements
 
-The repository does not include raw KYRBS data due to usage restrictions.
-Users must obtain the data independently and place kyrbs_merged.csv in the project root.
+Main dependencies: pandas, numpy, scikit-learn, xgboost, networkx, matplotlib.
 
-All scripts are prepared for open-source release and reproducible research.
+## License
 
----
-## 📝 License
-
-MIT License
+MIT License  
 © CHA University
